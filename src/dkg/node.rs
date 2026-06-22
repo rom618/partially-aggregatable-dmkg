@@ -47,6 +47,7 @@ impl<
                 scheme_sig,
                 participants,
                 transcript: DKGTranscript::empty(degree, num_participants),
+                qagg: std::collections::BTreeSet::new(),
             },
             dealer,
         };
@@ -250,6 +251,7 @@ mod test {
     use ark_ff::{UniformRand, Zero};
     use rand::thread_rng;
 
+    use std::collections::BTreeSet;
     use std::marker::PhantomData;
 
     #[test]
@@ -298,6 +300,7 @@ mod test {
                 scheme_sig: bls_sig.clone(),
                 participants: participants.clone().into_iter().enumerate().collect(),
                 transcript: DKGTranscript::empty(degree, num_participants),
+                qagg: BTreeSet::new(),
             },
             dealer,
         };
@@ -364,6 +367,7 @@ mod test {
                     scheme_sig: bls_sig.clone(),
                     participants: participants.clone().into_iter().enumerate().collect(),
                     transcript: DKGTranscript::empty(degree, num_participants),
+                    qagg: BTreeSet::new(),
                 },
                 dealer: dealers[i].clone(),
             };
@@ -378,6 +382,103 @@ mod test {
                     .unwrap();
             }
         }
+    }
+
+    // A contributor whose PVSS share fails verification is recorded in Qagg;
+    // honest contributors are not.
+    #[test]
+    fn test_qagg_records_dishonest_contributor() {
+        const NODES: usize = 4;
+        const TAMPERED: usize = 1;
+
+        let rng = &mut thread_rng();
+        let srs = SRS::<Bls12_381>::setup(rng).unwrap();
+        let bls_sig = BLSSignature::<BLSSignatureG1<Bls12_381>> {
+            srs: BLSSRS {
+                g_public_key: srs.h_g2,
+                g_signature: srs.g_g1,
+            },
+        };
+        let bls_pok = BLSSignature::<BLSSignatureG2<Bls12_381>> {
+            srs: BLSSRS {
+                g_public_key: srs.g_g1,
+                g_signature: srs.h_g2,
+            },
+        };
+
+        let u_1 = G2Projective::rand(rng).into_affine();
+        let dkg_config = Config {
+            srs: srs.clone(),
+            u_1,
+            degree: 2,
+        };
+
+        let mut dealers = vec![];
+        for i in 0..NODES {
+            let dealer_keypair_sig = bls_sig.generate_keypair(rng).unwrap();
+            let participant = Participant {
+                pairing_type: PhantomData,
+                id: i,
+                public_key_sig: dealer_keypair_sig.1,
+                state: ParticipantState::Dealer,
+            };
+            dealers.push(Dealer {
+                private_key_sig: dealer_keypair_sig.0,
+                accumulated_secret: G2Projective::zero().into_affine(),
+                participant,
+            });
+        }
+
+        let participants = dealers
+            .iter()
+            .map(|d| d.participant.clone())
+            .collect::<Vec<_>>();
+        let num_participants = participants.len();
+        let degree = dkg_config.degree;
+
+        let mut nodes = vec![];
+        for i in 0..NODES {
+            nodes.push(Node {
+                aggregator: DKGAggregator {
+                    config: dkg_config.clone(),
+                    scheme_pok: bls_pok.clone(),
+                    scheme_sig: bls_sig.clone(),
+                    participants: participants.clone().into_iter().enumerate().collect(),
+                    transcript: DKGTranscript::empty(degree, num_participants),
+                    qagg: BTreeSet::new(),
+                },
+                dealer: dealers[i].clone(),
+            });
+        }
+
+        let mut aggregator = DKGAggregator {
+            config: dkg_config.clone(),
+            scheme_pok: bls_pok.clone(),
+            scheme_sig: bls_sig.clone(),
+            participants: participants.clone().into_iter().enumerate().collect(),
+            transcript: DKGTranscript::empty(degree, num_participants),
+            qagg: BTreeSet::new(),
+        };
+
+        for i in 0..NODES {
+            let mut share = nodes[i].share(rng).unwrap();
+            if i == TAMPERED {
+                // Corrupt the commitment so the contribution fails verification.
+                share.c_i = G1Projective::rand(rng).into_affine();
+                aggregator.receive_share(rng, &share).unwrap_err();
+            } else {
+                aggregator.receive_share(rng, &share).unwrap();
+            }
+        }
+
+        // The tampered dealer is reported; honest ones are not.
+        assert!(aggregator.qagg.contains(&TAMPERED));
+        for i in 0..NODES {
+            if i != TAMPERED {
+                assert!(!aggregator.qagg.contains(&i));
+            }
+        }
+        assert_eq!(aggregator.qagg.len(), 1);
     }
 
     #[test]
@@ -464,6 +565,7 @@ mod test {
             scheme_sig: ssig.clone(),
             participants: participants.clone().into_iter().enumerate().collect(),
             transcript: DKGTranscript::empty(dkg_config.degree, num_participants),
+            qagg: BTreeSet::new(),
         };
 
         let mut nodes = vec![];
@@ -476,6 +578,7 @@ mod test {
                     scheme_sig: ssig.clone(),
                     participants: participants.clone().into_iter().enumerate().collect(),
                     transcript: DKGTranscript::empty(degree, num_participants),
+                    qagg: BTreeSet::new(),
                 },
                 dealer: dealers[i].clone(),
             };
@@ -520,6 +623,7 @@ mod test {
                     scheme_sig: ssig.clone(),
                     participants: participants.clone().into_iter().enumerate().collect(),
                     transcript: DKGTranscript::empty(degree, num_participants),
+                    qagg: BTreeSet::new(),
                 },
                 dealer: dealers[i].clone(),
             };

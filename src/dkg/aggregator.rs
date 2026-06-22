@@ -11,7 +11,7 @@ use crate::{
 use ark_ec::{msm::VariableBaseMSM, AffineCurve, PairingEngine, ProjectiveCurve};
 use ark_ff::{One, PrimeField, UniformRand, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
-use ark_std::collections::BTreeMap;
+use ark_std::collections::{BTreeMap, BTreeSet};
 use rand::Rng;
 use std::ops::Neg;
 
@@ -26,6 +26,10 @@ pub struct DKGAggregator<
     pub participants: BTreeMap<usize, Participant<E, SSIG>>,
 
     pub transcript: DKGTranscript<E, SPOK, SSIG>,
+
+    /// Contributors whose PVSS share failed verification. Exported so the
+    /// complaint phase of the Pedersen layer can short-circuit on them.
+    pub qagg: BTreeSet<usize>,
 }
 
 impl<
@@ -39,7 +43,11 @@ impl<
         rng: &mut R,
         share: &DKGShare<E, SPOK, SSIG>,
     ) -> Result<(), DKGError<E>> {
-        self.share_verify(rng, share)?;
+        // A contribution that fails verification records its dealer in Qagg.
+        if let Err(e) = self.share_verify(rng, share) {
+            self.qagg.insert(share.participant_id);
+            return Err(e);
+        }
         let transcript = DKGTranscript {
             degree: self.config.degree,
             num_participants: self.participants.len(),

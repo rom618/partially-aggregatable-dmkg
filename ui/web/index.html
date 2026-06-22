@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Partially Aggregatable DMKG - Interactive</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Partially Aggregatable <span class="accent">DMKG</span></h1>
+    <p class="subtitle">Distributed Multi-Key Generation - step through the protocol and inspect what each participant knows.</p>
+  </header>
+
+  <div class="layout">
+    <!-- ===================== Sidebar: configuration + control ===================== -->
+    <aside class="sidebar">
+      <section class="panel">
+        <h2>Configuration</h2>
+
+        <label class="field">
+          <span>Participants <code>n</code>: <span id="nVal">4</span></span>
+          <input type="range" id="nInput" min="2" max="10" value="4" />
+        </label>
+
+        <label class="field">
+          <span>Threshold <code>t</code> (degree): <span id="tVal">2</span></span>
+          <input type="range" id="tInput" min="1" max="9" value="2" />
+          <small id="tHint">reconstruct from <code>t+1</code> shares; default <code>n/2</code></small>
+        </label>
+
+        <div class="field">
+          <span>Malicious participants <small>(per participant)</small></span>
+          <div id="malBoxes" class="mal-boxes"></div>
+          <small class="mal-legend">
+            z: corrupt z, caught in Q<sub>agg</sub> (before aggregation).
+            Pedersen: bad share, caught by complaint (after Q<sub>agg</sub>).
+            both: original demo.
+          </small>
+        </div>
+
+        <div class="btn-row">
+          <button id="configureBtn" class="primary">Apply &amp; restart</button>
+          <button id="resetBtn">Reset</button>
+        </div>
+        <p id="configError" class="error-msg"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Protocol phase</h2>
+        <ol id="phaseList" class="phases">
+          <li data-phase="0">Setup</li>
+          <li data-phase="1">Distribution</li>
+          <li data-phase="2">z-Aggregation</li>
+          <li data-phase="3">Verification</li>
+          <li data-phase="4">Complaints</li>
+          <li data-phase="5">Key generation</li>
+          <li data-phase="6">Done</li>
+        </ol>
+        <button id="advanceBtn" class="primary wide">Advance &raquo;</button>
+      </section>
+
+      <section class="panel legend">
+        <h2>Legend</h2>
+        <ul>
+          <li><span class="dot public"></span> Public - on the broadcast channel</li>
+          <li><span class="dot private"></span> Private - known only to that party</li>
+          <li><span class="badge mal">malicious</span> corrupted dealer</li>
+          <li><span class="badge qagg">Q<sub>agg</sub></span> reported by the <code>z</code> layer</li>
+          <li><span class="badge qual">QUAL</span> qualified for the key</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- ===================== Main: state + participants + log ===================== -->
+    <main class="main">
+      <!-- Setup assumptions & common reference (CRS) -->
+      <section class="panel setup-panel">
+        <details open>
+          <summary><h2 style="display:inline">What's assumed at the start <small>(channels, common values, CRS)</small></h2></summary>
+          <p class="setup-note">
+            Model: a static adversary and a fully synchronous authenticated broadcast
+            channel available to all. So:
+          </p>
+          <ul class="setup-list">
+            <li>Participant set is known: everyone knows the ids and the published public
+              keys (the <code>G2</code> BLS keys and the <code>G1</code> ElGamal keys).</li>
+            <li>Broadcast channel is open to all. Private channels are not needed: encrypted
+              shares ride the public broadcast.</li>
+            <li>Each party privately holds its two secret keys (BLS signing and ElGamal).</li>
+          </ul>
+          <p class="setup-note">Common public values every party shares from the start:</p>
+          <div class="crs-grid">
+            <div><span class="k">SRS <code>g</code> ∈ G1 <em>(CRS)</em></span><code id="crsGg1">-</code></div>
+            <div><span class="k">SRS <code>ĥ</code> ∈ G2 <em>(CRS)</em></span><code id="crsHg2">-</code></div>
+            <div><span class="k"><code>u₁</code> ∈ G2</span><code id="crsU1">-</code></div>
+            <div><span class="k">degree / threshold <code>t</code></span><code id="crsDegree">-</code></div>
+            <div><span class="k">Pedersen <code>g1</code> (NUMS)</span><code id="crsPedG1">-</code></div>
+            <div><span class="k">Pedersen <code>g2</code> (NUMS)</span><code id="crsPedG2">-</code></div>
+            <div><span class="k">Pedersen <code>h1</code> (NUMS)</span><code id="crsPedH1">-</code></div>
+            <div><span class="k">Pedersen <code>h2</code> (NUMS)</span><code id="crsPedH2">-</code></div>
+            <div><span class="k">ElGamal base <code>g</code> (NUMS)</span><code id="crsElg">-</code></div>
+            <div><span class="k">z-layer domain (roots of unity)</span><code id="crsDomain">-</code></div>
+          </div>
+          <p class="setup-note muted">
+            The four Pedersen generators and the ElGamal base are derived by hash-to-curve
+            (nothing-up-my-sleeve), so every party reproduces them with no trusted setup. Only
+            <code>g</code>, <code>ĥ</code>, <code>u₁</code> would need a transparent/trusted
+            ceremony in a real deployment - no powers-of-tau-style structured CRS is required.
+            (Here they are sampled randomly at startup.)
+          </p>
+        </details>
+      </section>
+
+      <section class="panel global">
+        <h2>Global state</h2>
+        <div class="global-grid">
+          <div><span class="k">Q<sub>agg</sub></span><span id="qaggVal" class="v">-</span></div>
+          <div><span class="k">Complaints</span><span id="complaintsVal" class="v">-</span></div>
+          <div><span class="k">QUAL</span><span id="qualVal" class="v">-</span></div>
+        </div>
+        <div id="pkBox" class="pk-box hidden">
+          <h3>Public key <code>pk = (c1, c2, c3)</code> <span id="pkRecon" class="badge"></span></h3>
+          <div class="pk-line"><span class="k">c1 = g1<sup>x1</sup>·g2<sup>x2</sup></span><code id="pkC1"></code></div>
+          <div class="pk-line"><span class="k">c2 = g1<sup>y1</sup>·g2<sup>y2</sup></span><code id="pkC2"></code></div>
+          <div class="pk-line"><span class="k">c3 = g1<sup>z</sup></span><code id="pkC3"></code></div>
+        </div>
+      </section>
+
+      <!-- z-aggregation tree - shown from ZAggregation phase onward -->
+      <section id="zTreePanel" class="panel hidden">
+        <h2>z-layer aggregation tree <small>(SCRAPE PVSS - binary tree gossip)</small></h2>
+        <p class="ztree-hint">
+          Each dealer's PVSS share for the secret <code>z</code> is verified at the leaves,
+          then pairwise aggregated up the tree: ceil(log2 n) rounds, n-1 messages
+          (vs O(n^2) for the Pedersen layer). Grayed-out levels are yet to be processed.
+        </p>
+        <div id="zTreeBody" class="ztree-body"></div>
+        <div id="zTreeBroadcast" class="ztree-broadcast hidden"></div>
+        <div id="zTreeProgress" class="ztree-progress"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Participants <small>(click a card to inspect)</small></h2>
+        <div id="participants" class="participants"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Event log</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ===================== Inspector modal ===================== -->
+  <div id="inspector" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="inspTitle">Participant</h2>
+        <button id="inspClose" class="close">&times;</button>
+      </div>
+      <div id="inspBadges" class="insp-badges"></div>
+      <div class="insp-cols">
+        <div class="insp-col public-col">
+          <h3><span class="dot public"></span> Public data</h3>
+          <dl id="inspPublic"></dl>
+        </div>
+        <div class="insp-col private-col">
+          <h3><span class="dot private"></span> Private data <span class="lock">🔒</span></h3>
+          <dl id="inspPrivate"></dl>
+        </div>
+      </div>
+      <div class="insp-col comm-col">
+        <h3><span class="dot comm"></span> Communication <small>(messages on public channels)</small></h3>
+        <dl id="inspComm"></dl>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

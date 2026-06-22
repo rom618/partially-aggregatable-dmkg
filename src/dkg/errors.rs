@@ -23,4 +23,12 @@ pub enum DKGError<E: PairingEngine> {
     TranscriptDifferentConfig(usize, usize, usize, usize),
     #[error("Transcripts have different commitments")]
     TranscriptDifferentCommitments,
+    #[error("MSS polynomial degree too small (need >= 1 to pin two points): {0}")]
+    MSSInsufficientDegree(usize),
+    #[error("MSS recovery received duplicate or insufficient evaluation indices")]
+    MSSBadIndices,
+    #[error("Pedersen share check (Eq. 1) failed for receiver {0}")]
+    PedersenShareCheckError(usize),
+    #[error("Pedersen distribution malformed: {0}")]
+    PedersenMalformed(&'static str),
 }

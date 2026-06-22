@@ -111,6 +111,7 @@ fn benchmark_with_signature_scheme<
                 scheme_sig: ssig.clone(),
                 participants: participants.clone().into_iter().enumerate().collect(),
                 transcript: DKGTranscript::empty(dkg_config.degree, num_participants),
+                qagg: std::collections::BTreeSet::new(),
             };
 
             let mut nodes = vec![];
@@ -123,6 +124,7 @@ fn benchmark_with_signature_scheme<
                         scheme_sig: ssig.clone(),
                         participants: participants.clone().into_iter().enumerate().collect(),
                         transcript: DKGTranscript::empty(degree, num_participants),
+                        qagg: std::collections::BTreeSet::new(),
                     },
                     dealer: dealers[i].clone(),
                 };
@@ -164,6 +166,7 @@ fn benchmark_with_signature_scheme<
                                         dkg_config.degree,
                                         num_participants,
                                     ),
+                                    qagg: std::collections::BTreeSet::new(),
                                 };
 
                                 aggregator.receive_share(rng, &share.clone()).unwrap();
@@ -183,6 +186,7 @@ fn benchmark_with_signature_scheme<
                         scheme_sig: ssig.clone(),
                         participants: participants.clone().into_iter().enumerate().collect(),
                         transcript: DKGTranscript::empty(degree, num_participants),
+                        qagg: std::collections::BTreeSet::new(),
                     },
                     dealer: dealers[i].clone(),
                 };
@@ -211,6 +215,7 @@ fn benchmark_with_signature_scheme<
                                             .enumerate()
                                             .collect(),
                                         transcript: DKGTranscript::empty(degree, num_participants),
+                                        qagg: std::collections::BTreeSet::new(),
                                     },
                                     dealer: dealers[i].clone(),
                                 };

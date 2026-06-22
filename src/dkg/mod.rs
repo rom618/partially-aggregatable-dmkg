@@ -1,9 +1,16 @@
 pub mod aggregator;
+pub mod complaint;
 pub mod config;
 pub mod dealer;
+pub mod dmkg;
+pub mod encryption;
 pub mod errors;
+pub mod mss;
+#[cfg(feature = "network")]
+pub mod network;
 pub mod node;
 pub mod participant;
+pub mod pedersen;
 pub mod pvss;
 pub mod share;
 pub mod srs;
