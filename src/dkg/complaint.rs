@@ -1,30 +1,25 @@
-//! Simplified complaint management.
+//! Phase 5 — simplified complaint management (paper §4.3 Phase 3).
 //!
-//! Runs only when a receiver complained that a share it decrypted from a dealer
-//! failed the Pedersen check. For each accused dealer:
+//! The complaint phase runs **only** when some receiver `Pⱼ` complained that the
+//! share it decrypted from dealer `Pᵢ` failed the Pedersen check (Eq. 1). For each
+//! accused dealer the resolution order is exactly the paper's:
 //!
-//! 1. if it is in `Qagg` (already flagged by the z layer), disqualify it without
-//!    a disputation - the simplification the aggregatable z layer buys us;
-//! 2. else if it has more than `t-1` distinct complaints, disqualify it;
-//! 3. else run a disputation over the neutral set: neutrals contribute random
-//!    blinds, the accused publishes a blinded opening, the neutrals recompute the
-//!    relation and vote, and the majority decides. Honest parties never reveal a
-//!    share in the clear.
+//! 1. If `Pᵢ ∈ Qagg` (already reported dishonest by the publicly verifiable `z`
+//!    layer) → **disqualify immediately**.
+//! 2. Else if `#complaints(Pᵢ) > t−1` → **disqualify**.
+//! 3. Else run the **Neji-style disputation** over the neutral set
+//!    `Q = Qtemp \ {Pᵢ, Pⱼ}`: neutral parties contribute random blinds, the accused
+//!    publishes a blinded opening `(λ, λ', γ, γ')`, every neutral recomputes the
+//!    blinded relation (Eq. 2) and **votes**; the majority decides.
 //!
-//! `QUAL` is the set of dealers left standing; recovery sums shares over it.
-//!
-//! The disputation is modelled at the opening level: the accused opens the share
-//! it claims to have dealt, blinded by the neutrals' randomness, and the neutrals
-//! check it against the public commitments. A deployed system would secret-share
-//! the blinds and reveal them only after the accused commits; here they are
-//! revealed for the recomputation. A cheating dealer still cannot open validly, a
-//! lying complainer's target does, and no raw share is published.
+//! Uses only plain group operations (no pairing), so it is generic over
+//! `C: ProjectiveCurve`.
 
 use crate::dkg::{
-    errors::DKGError,
+    errors::VssError,
     pedersen::{PedersenGenerators, PedersenShare},
 };
-use ark_ec::{AffineCurve, PairingEngine, ProjectiveCurve};
+use ark_ec::{AffineCurve, ProjectiveCurve};
 use ark_ff::{One, PrimeField, UniformRand, Zero};
 use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +45,7 @@ pub enum Verdict {
 pub enum DisqualificationReason {
     /// Member of `Qagg` (reported dishonest by the `z` layer).
     InQagg,
-    /// More than `t-1` independent complaints.
+    /// More than `t−1` independent complaints.
     TooManyComplaints,
     /// Lost a disputation by majority vote.
     LostDisputation,
@@ -59,20 +54,20 @@ pub enum DisqualificationReason {
 /// One neutral party's blind contribution (paper Step 3): random scalars and the
 /// matching Pedersen commitment `S''ₖ = g1^{Δa}·h1^{Δb}·g2^{Δa'}·h2^{Δb'}` that is
 /// published so the others can recompute Eq. (2).
-struct NeutralBlind<E: PairingEngine> {
-    da: E::Fr,
-    db: E::Fr,
-    da_prime: E::Fr,
-    db_prime: E::Fr,
-    commitment: E::G1Affine,
+struct NeutralBlind<C: ProjectiveCurve> {
+    da: C::ScalarField,
+    db: C::ScalarField,
+    da_prime: C::ScalarField,
+    db_prime: C::ScalarField,
+    commitment: C::Affine,
 }
 
-impl<E: PairingEngine> NeutralBlind<E> {
-    fn sample<R: Rng>(generators: &PedersenGenerators<E>, rng: &mut R) -> Self {
-        let da = E::Fr::rand(rng);
-        let db = E::Fr::rand(rng);
-        let da_prime = E::Fr::rand(rng);
-        let db_prime = E::Fr::rand(rng);
+impl<C: ProjectiveCurve> NeutralBlind<C> {
+    fn sample<R: Rng>(generators: &PedersenGenerators<C>, rng: &mut R) -> Self {
+        let da = C::ScalarField::rand(rng);
+        let db = C::ScalarField::rand(rng);
+        let da_prime = C::ScalarField::rand(rng);
+        let db_prime = C::ScalarField::rand(rng);
         let commitment = (generators.g1.mul(da.into_repr())
             + generators.h1.mul(db.into_repr())
             + generators.g2.mul(da_prime.into_repr())
@@ -89,10 +84,10 @@ impl<E: PairingEngine> NeutralBlind<E> {
 }
 
 /// Expected commitment-at-`j`: `∏ₖ CMₖ^{ jᵏ }`.
-fn commitment_at<E: PairingEngine>(commitments: &[E::G1Affine], j: usize) -> E::G1Projective {
-    let j_fr = E::Fr::from(j as u64);
-    let mut acc = E::G1Projective::zero();
-    let mut power = E::Fr::one();
+fn commitment_at<C: ProjectiveCurve>(commitments: &[C::Affine], j: usize) -> C {
+    let j_fr = C::ScalarField::from(j as u64);
+    let mut acc = C::zero();
+    let mut power = C::ScalarField::one();
     for cm in commitments.iter() {
         acc += cm.mul(power.into_repr());
         power *= j_fr;
@@ -100,28 +95,28 @@ fn commitment_at<E: PairingEngine>(commitments: &[E::G1Affine], j: usize) -> E::
     acc
 }
 
-/// Run one Neji-style disputation (Steps 3.a-3.i) for the accusation
-/// `(dealer Pᵢ, complainer Pⱼ)`, with `neutral_count` neutral parties.
-///
-/// `dealer_opening` is the cleartext share the accused dealer claims it dealt to
-/// `Pⱼ`. The neutrals blind it, recompute Eq. (2), and vote; the majority verdict
-/// is returned. A corrupt minority (`< n/2`) of neutrals cannot flip the outcome,
-/// so the returned verdict is the honest majority's.
-pub fn resolve_disputation<E: PairingEngine, R: Rng>(
-    generators: &PedersenGenerators<E>,
-    commitments: &[E::G1Affine],
+/// Run one Neji-style disputation for the accusation `(dealer Pᵢ, complainer Pⱼ)`,
+/// with `neutral_count` neutral parties.
+pub fn resolve_disputation<C: ProjectiveCurve, R: Rng>(
+    generators: &PedersenGenerators<C>,
+    commitments: &[C::Affine],
     j: usize,
-    dealer_opening: &PedersenShare<E>,
+    dealer_opening: &PedersenShare<C>,
     neutral_count: usize,
     rng: &mut R,
 ) -> Verdict {
     // Step 3 (neutrals): each neutral publishes a blind commitment S''ₖ.
-    let blinds: Vec<NeutralBlind<E>> = (0..neutral_count)
+    let blinds: Vec<NeutralBlind<C>> = (0..neutral_count)
         .map(|_| NeutralBlind::sample(generators, rng))
         .collect();
 
     let (sum_da, sum_db, sum_da_prime, sum_db_prime) = blinds.iter().fold(
-        (E::Fr::zero(), E::Fr::zero(), E::Fr::zero(), E::Fr::zero()),
+        (
+            C::ScalarField::zero(),
+            C::ScalarField::zero(),
+            C::ScalarField::zero(),
+            C::ScalarField::zero(),
+        ),
         |(a, b, ap, bp), bl| (a + bl.da, b + bl.db, ap + bl.da_prime, bp + bl.db_prime),
     );
 
@@ -139,14 +134,12 @@ pub fn resolve_disputation<E: PairingEngine, R: Rng>(
         + generators.h2.mul(gamma_prime.into_repr()))
     .into_affine();
 
-    let mut rhs = commitment_at::<E>(commitments, j);
+    let mut rhs = commitment_at::<C>(commitments, j);
     for bl in blinds.iter() {
         rhs += bl.commitment.into_projective();
     }
     let rhs = rhs.into_affine();
 
-    // The check is deterministic over public data, so every honest neutral votes
-    // identically; the honest majority therefore decides.
     if lhs == rhs {
         Verdict::ComplainerDishonest
     } else {
@@ -163,27 +156,18 @@ pub struct ComplaintOutcome {
 }
 
 /// Run the simplified complaint phase over all dealers.
-///
-/// * `degree` is the polynomial degree `t` (so the disqualification threshold is
-///   `t-1`).
-/// * `all_dealers` is the set of dealer ids that took part in distribution.
-/// * `qagg` is the set of dealers flagged by the z layer.
-/// * `commitments` / `openings` give, per dealer, the public `CMₖ` and the
-///   cleartext share the dealer would open for any complained-about receiver.
-/// * `complaints` is the list of filed complaints (empty ⇒ phase is a no-op and
-///   every dealer is qualified).
 #[allow(clippy::too_many_arguments)]
-pub fn run_complaint_phase<E: PairingEngine, R: Rng>(
-    generators: &PedersenGenerators<E>,
+pub fn run_complaint_phase<C: ProjectiveCurve, R: Rng>(
+    generators: &PedersenGenerators<C>,
     degree: usize,
     all_dealers: &BTreeSet<usize>,
     qagg: &BTreeSet<usize>,
-    commitments: &BTreeMap<usize, Vec<E::G1Affine>>,
-    openings: &BTreeMap<usize, Vec<PedersenShare<E>>>,
+    commitments: &BTreeMap<usize, Vec<C::Affine>>,
+    openings: &BTreeMap<usize, Vec<PedersenShare<C>>>,
     complaints: &[Complaint],
     neutral_count: usize,
     rng: &mut R,
-) -> Result<ComplaintOutcome, DKGError<E>> {
+) -> Result<ComplaintOutcome, VssError> {
     let mut disqualified: BTreeMap<usize, DisqualificationReason> = BTreeMap::new();
 
     // Group complaints by accused dealer.
@@ -207,17 +191,14 @@ pub fn run_complaint_phase<E: PairingEngine, R: Rng>(
         // Step 3: disputation per complaint; a single lost disputation disqualifies.
         let dealer_commitments = commitments
             .get(&dealer)
-            .ok_or(DKGError::PedersenMalformed("missing dealer commitments"))?;
+            .ok_or(VssError::Malformed("missing dealer commitments"))?;
         let dealer_openings = openings
             .get(&dealer)
-            .ok_or(DKGError::PedersenMalformed("missing dealer openings"))?;
+            .ok_or(VssError::Malformed("missing dealer openings"))?;
         for &complainer in distinct.iter() {
-            let opening =
-                dealer_openings
-                    .get(complainer - 1)
-                    .ok_or(DKGError::PedersenMalformed(
-                        "missing opening for complainer",
-                    ))?;
+            let opening = dealer_openings
+                .get(complainer - 1)
+                .ok_or(VssError::Malformed("missing opening for complainer"))?;
             let verdict = resolve_disputation(
                 generators,
                 dealer_commitments,
@@ -248,13 +229,13 @@ mod test {
         resolve_disputation, run_complaint_phase, Complaint, DisqualificationReason, Verdict,
     };
     use crate::dkg::pedersen::{PedersenDistribution, PedersenGenerators};
-    use ark_bls12_381::Bls12_381;
+    use ark_bls12_381::G1Projective;
     use ark_ff::UniformRand;
     use rand::thread_rng;
     use std::collections::{BTreeMap, BTreeSet};
 
-    type Gens = PedersenGenerators<Bls12_381>;
-    type Pedersen = PedersenDistribution<Bls12_381>;
+    type Gens = PedersenGenerators<G1Projective>;
+    type Pedersen = PedersenDistribution<G1Projective>;
 
     const DEGREE: usize = 3;
     const N: usize = 8;
@@ -301,7 +282,6 @@ mod test {
             commitments.insert(*d, dist.commitments.clone());
             openings.insert(*d, dist.shares.clone());
         }
-        // Someone complains about the Qagg dealer (the share content is irrelevant).
         let complaints = vec![Complaint {
             dealer: 2,
             complainer: 1,
@@ -330,8 +310,7 @@ mod test {
         }
     }
 
-    // (iv) An honest dealer / honest pair: no complaint resolves against the dealer,
-    // and with no complaints at all every dealer is qualified.
+    // (iv) An honest dealer / honest pair: no complaint resolves against the dealer.
     #[test]
     fn test_honest_pair_cleared() {
         let rng = &mut thread_rng();
@@ -347,7 +326,6 @@ mod test {
             openings.insert(*d, dist.shares.clone());
         }
 
-        // A spurious complaint against an honest dealer 1 must NOT disqualify it.
         let complaints = vec![Complaint {
             dealer: 1,
             complainer: 3,
@@ -367,7 +345,6 @@ mod test {
         assert!(outcome.qual.contains(&1));
         assert!(outcome.disqualified.is_empty());
 
-        // No complaints at all ⇒ everyone qualifies.
         let outcome2 = run_complaint_phase(
             &gens,
             DEGREE,
@@ -383,8 +360,7 @@ mod test {
         assert_eq!(outcome2.qual, dealers);
     }
 
-    // The `#complaints > t-1` rule disqualifies a dealer with too many accusers,
-    // even though each individual opening would have verified.
+    // The `#complaints > t−1` rule disqualifies a dealer with too many accusers.
     #[test]
     fn test_too_many_complaints_disqualifies() {
         let rng = &mut thread_rng();
@@ -399,7 +375,6 @@ mod test {
             commitments.insert(*d, dist.commitments.clone());
             openings.insert(*d, dist.shares.clone());
         }
-        // t-1 = 2, so 3 distinct complainers exceed the threshold.
         let complaints = vec![
             Complaint {
                 dealer: 0,

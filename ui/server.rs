@@ -1,9 +1,10 @@
-//! Tiny std-only HTTP server for the interactive DMKG UI.
+//! Interactive DMKG UI - a tiny std-only HTTP server.
 //!
-//! Serves a single-page vanilla-JS frontend and a small JSON API to run an interactive DMKG
-//! session.
+//! Serves a single-page vanilla-JS frontend and a small JSON API over a shared
+//! [`DkgSession`]. No web framework, no async runtime: one thread per connection,
+//! one request per connection. Intended for local use with `n <= 10`.
 //!
-//! Run: cargo run --release --features ui --bin dkg_ui
+//! Run: `cargo run --release --features ui --bin dkg_ui`
 
 use aggregatable_dkg::sim::{
     CommonReferenceView, DkgSession, Malice, ParticipantView, PublicKeyView, Snapshot,
@@ -15,6 +16,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+// Frontend assets are bundled into the binary - a single `cargo run`, no files to ship.
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_JS: &str = include_str!("web/app.js");
 const STYLE_CSS: &str = include_str!("web/style.css");
@@ -33,6 +35,7 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
 
+    // Default configuration: 4 honest participants, threshold t = 2.
     let n = 4;
     let degree = 2;
     let malice = BTreeMap::new();
@@ -80,6 +83,7 @@ fn handle(mut stream: TcpStream, state: Arc<Mutex<AppState>>) -> std::io::Result
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
+    // Headers (we only care about Content-Length).
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
@@ -95,6 +99,7 @@ fn handle(mut stream: TcpStream, state: Arc<Mutex<AppState>>) -> std::io::Result
         }
     }
 
+    // Body.
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -169,6 +174,9 @@ fn route(
     }
 }
 
+/// Parse the per-participant malice from a configure request. Accepts the new
+/// `malice` object (`{ "1": "z", "2": "pedersen" }`) and, as a fallback, the
+/// legacy `malicious` array of ids (each interpreted as `both`).
 fn parse_malice(parsed: &Value) -> BTreeMap<usize, Malice> {
     let mut out = BTreeMap::new();
     if let Some(obj) = parsed.get("malice").and_then(|v| v.as_object()) {

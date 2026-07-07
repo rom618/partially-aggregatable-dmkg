@@ -27,8 +27,10 @@ pub struct DKGAggregator<
 
     pub transcript: DKGTranscript<E, SPOK, SSIG>,
 
-    /// Contributors whose PVSS share failed verification. Exported so the
-    /// complaint phase of the Pedersen layer can short-circuit on them.
+    /// Set of contributors (`w_i != 0`) reported dishonest during `z`
+    /// verification/aggregation: a participant whose PVSS contribution fails a
+    /// check is recorded here. Exported so it can short-circuit the complaint
+    /// phase of the `(x1,x2,y1,y2)` layer (paper §2.1 / §4.3 Phase 3).
     pub qagg: BTreeSet<usize>,
 }
 
@@ -43,7 +45,9 @@ impl<
         rng: &mut R,
         share: &DKGShare<E, SPOK, SSIG>,
     ) -> Result<(), DKGError<E>> {
-        // A contribution that fails verification records its dealer in Qagg.
+        // A contribution that fails verification marks its dealer as
+        // reported-dishonest in `Qagg` (paper §2.1). Every dealer reaching this
+        // path is a contributor with weight 1 (`w_i != 0`).
         if let Err(e) = self.share_verify(rng, share) {
             self.qagg.insert(share.participant_id);
             return Err(e);

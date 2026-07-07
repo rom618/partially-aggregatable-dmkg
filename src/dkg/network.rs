@@ -1,22 +1,28 @@
-//! Network simulation (Tokio), behind the `network` feature.
+//! Phase 7 — Tokio network simulation (gated behind the `network` feature).
 //!
-//! The protocol is synchronous; this wraps message passing in an async layer so
-//! network cost can be measured separately from computation. It models the two
-//! patterns the protocol uses:
+//! The DMKG protocol itself is synchronous; this module wraps message passing in
+//! an async layer so we can measure **network cost separately from computation**.
+//! It models the two communication patterns the protocol uses:
 //!
-//! * `broadcast_round` - all-to-all (the non-aggregatable Pedersen layer):
-//!   n(n-1) messages, O(n^2) bytes, one latency round.
-//! * `tree_gossip` - binary-tree aggregation (the aggregatable z layer): n-1
-//!   messages over ceil(log2 n) sequential rounds.
+//! * [`broadcast_round`] — the **all-to-all** pattern of the non-aggregatable
+//!   Pedersen `(x1,x2,y1,y2)` layer: every node ships its (encrypted) shares to
+//!   every other node. `n·(n−1)` messages, `O(n²)` bytes, **one** latency round.
+//! * [`tree_gossip`] — the **binary-tree aggregation** of the aggregatable `z`
+//!   SCRAPE layer: transcripts are combined up a tree. `n−1` messages,
+//!   `⌈log₂ n⌉` sequential latency rounds.
 //!
-//! Each delivery waits the injected latency before arriving, so wall-clock
-//! reflects the round structure. Payloads are opaque buffers sized from the real
-//! serialized message sizes.
+//! Each link delivery waits `latency` (injected WAN latency, 50–200 ms in the
+//! benchmarks) before the payload arrives, so the wall-clock numbers reflect the
+//! round structure of each pattern. Payloads are opaque byte buffers; their sizes
+//! come from the real `CanonicalSerialize` message sizes measured in the
+//! benchmark binary, keeping the byte accounting faithful without re-running the
+//! cryptography inside the network layer.
 
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Timing and volume of one simulated communication phase (network only).
+/// Timing + volume of one simulated communication phase. The network and compute
+/// clocks are deliberately kept apart: this struct is *network only*.
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkReport {
     /// Wall-clock time for the whole phase (dominated by latency rounds).
@@ -30,7 +36,7 @@ pub struct NetworkReport {
 }
 
 /// All-to-all broadcast: every one of `n` nodes sends a `payload`-byte message to
-/// each of the other `n-1` nodes. All links fire concurrently, so the phase takes
+/// each of the other `n−1` nodes. All links fire concurrently, so the phase takes
 /// a single latency round regardless of `n` (bandwidth is not modelled), while the
 /// message and byte counts grow as `O(n²)`.
 pub async fn broadcast_round(n: usize, latency: Duration, payload: usize) -> NetworkReport {
@@ -96,7 +102,7 @@ pub async fn broadcast_round(n: usize, latency: Duration, payload: usize) -> Net
 
 /// Binary-tree aggregation gossip: `n` leaves combine pairwise up the tree. Each
 /// of the `⌈log₂ n⌉` levels is a sequential latency round (a node must receive its
-/// child's transcript before forwarding), and only `n-1` messages are sent. This
+/// child's transcript before forwarding), and only `n−1` messages are sent. This
 /// is the communication shape that makes the aggregatable `z` layer `O(n log n)`.
 pub async fn tree_gossip(n: usize, latency: Duration, payload: usize) -> NetworkReport {
     let start = Instant::now();
@@ -153,7 +159,7 @@ mod test {
 
     #[test]
     fn test_broadcast_counts() {
-        // n·(n-1) messages, O(n²) bytes, one latency round.
+        // n·(n−1) messages, O(n²) bytes, one latency round.
         let r = run_broadcast_round(8, Duration::from_millis(0), 100);
         assert_eq!(r.messages, 8 * 7);
         assert_eq!(r.bytes, 8 * 7 * 100);
@@ -162,7 +168,7 @@ mod test {
 
     #[test]
     fn test_tree_rounds_logarithmic() {
-        // ⌈log₂ n⌉ rounds, n-1 messages for a power-of-two n.
+        // ⌈log₂ n⌉ rounds, n−1 messages for a power-of-two n.
         let r = run_tree_gossip(16, Duration::from_millis(0), 100);
         assert_eq!(r.rounds, 4);
         assert_eq!(r.messages, 15);

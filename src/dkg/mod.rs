@@ -6,6 +6,7 @@ pub mod dmkg;
 pub mod encryption;
 pub mod errors;
 pub mod mss;
+pub mod neji;
 #[cfg(feature = "network")]
 pub mod network;
 pub mod node;

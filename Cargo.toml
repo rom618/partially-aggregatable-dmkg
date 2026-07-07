@@ -11,6 +11,10 @@ ark-poly = { version = "^0.2.0", features = [ "std" ] }
 ark-serialize = { version = "^0.2.0", features = [ "std" ] }
 ark-std = { version = "^0.2.0", features = [ "std" ] }
 ark-bls12-381 = { version = "^0.2.0", features = [ "std" ] }
+# Jubjub: a non-pairing prime-order curve over BLS12-381's scalar field. Used to
+# instantiate the pairing-free DMKGs (neji, btsof, kalai2022) on a plain discrete-log
+# group, as their papers specify (a generic prime-order group, not a pairing curve).
+ark-ed-on-bls12-381 = { version = "^0.2.0", features = [ "std" ] }
 thiserror = "1.0.19"
 rand = "0.7.3"
 rand_chacha = { version = "0.2.1" }
@@ -45,17 +49,22 @@ huge-dkg-bench = []
 network = [ "tokio" ]
 ui = [ "serde_json" ]
 print-trace = [ "ark-std/print-trace" ]
+# Run the pairing-free protocols (neji, btsof, kalai2022) on BLS12-381 G1 instead
+# of Jubjub, so every protocol is measured on the same curve as the aggregatable
+# ones. Off by default (they run on Jubjub). See bin/dmkg_bench.rs.
+pf-bls = []
 
 [[bench]]
 name = "huge_dkg"
 harness = false
 required-features = [ "huge-dkg-bench" ]
 
-[[example]]
-name = "dmkg_bench"
-required-features = [ "network" ]
-
 [[bin]]
 name = "dkg_ui"
 path = "ui/server.rs"
 required-features = [ "ui" ]
+
+[[bin]]
+name = "dmkg_bench"
+path = "bin/dmkg_bench.rs"
+required-features = [ "network" ]

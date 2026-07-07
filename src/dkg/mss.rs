@@ -1,132 +1,141 @@
-//! Franklin-Yung multi-secret sharing.
+//! Franklin–Yung Multi-Secret Sharing (MSS) polynomial layout.
 //!
-//! A degree-`t` polynomial pins two secrets at the special points `f(-1) = s1`
-//! and `f(-2) = s2`; the remaining `t-1` coefficients are random. Receivers
-//! evaluate at integer points `j in [1,n]`, and any `t+1` shares Lagrange-recover
-//! the values at `-1` and `-2`:
+//! Each dealer in the `(x1,x2,y1,y2)` layer (paper §4.3 Phase 1) builds a
+//! degree-`t` polynomial that encodes **two** secrets at the special evaluation
+//! points `−1` and `−2`:
 //!
 //! ```text
-//! lambda1_j = prod_{k != j} (-1-k)/(j-k)   recovers f(-1)
-//! lambda2_j = prod_{k != j} (-2-k)/(j-k)   recovers f(-2)
+//! f(−1) = s₋₁    f(−2) = s₋₂
 //! ```
 //!
-//! This domain (integers plus -1, -2) is distinct from the roots-of-unity domain
-//! used by the z/SCRAPE layer; the two must not be mixed.
+//! The remaining `t−1` coefficients are random, so a degree-`t` polynomial has
+//! exactly `(t+1) − 2 = t−1` degrees of freedom left after pinning the two
+//! secrets. Receivers get shares `f(j)` at integer points `j ∈ [1,n]`, and any
+//! `t+1` of them Lagrange-recover the values at `−1` and `−2` (paper §4.3 Phase 4):
+//!
+//! ```text
+//! λ1ⱼ = ∏_{k∈Q, k≠j} (−1−k)/(j−k)      (recovers f(−1): x1, x2)
+//! λ2ⱼ = ∏_{k∈Q, k≠j} (−2−k)/(j−k)      (recovers f(−2): y1, y2)
+//! ```
+//!
+//! This is a **different evaluation domain** from the `z`/SCRAPE layer (which
+//! uses Radix2 roots of unity) - they must never be mixed.
+//!
+//! The polynomial is purely **scalar-field** arithmetic, so it is generic over the
+//! field `F` and carries no curve or pairing — both BLS12-381's `Fr` and Jubjub's
+//! scalar field instantiate it.
 
-use crate::dkg::errors::DKGError;
-use ark_ec::PairingEngine;
-use ark_ff::{Field, One, UniformRand, Zero};
+use crate::dkg::errors::VssError;
+use ark_ff::PrimeField;
 use rand::Rng;
 use std::marker::PhantomData;
 
-/// A degree-`t` polynomial over `E::Fr`, pinned at the Franklin-Yung special
-/// points `f(-1) = s₋₁`, `f(-2) = s₋₂`, with the remaining `t-1` coefficients
-/// drawn at random.
+/// A degree-`t` polynomial over the scalar field `F`, pinned at the Franklin–Yung
+/// special points `f(−1) = s₋₁`, `f(−2) = s₋₂`, with the remaining `t−1`
+/// coefficients drawn at random.
 ///
 /// `coeffs[k]` is the coefficient of `xᵏ`; `coeffs.len() == degree + 1`. This is
 /// a dealer-local secret object (its shares and commitments go on the wire, not
 /// the polynomial itself), so it deliberately does not derive serialization.
 #[derive(Clone, Debug)]
-pub struct MSSPolynomial<E: PairingEngine> {
-    pub coeffs: Vec<E::Fr>,
-    pairing_type: PhantomData<E>,
+pub struct MSSPolynomial<F: PrimeField> {
+    pub coeffs: Vec<F>,
+    field_type: PhantomData<F>,
 }
 
-impl<E: PairingEngine> MSSPolynomial<E> {
-    /// The special evaluation point `-1` (where `s₋₁`, i.e. `x1`/`x2`, lives).
-    pub fn point_minus1() -> E::Fr {
-        -E::Fr::one()
+impl<F: PrimeField> MSSPolynomial<F> {
+    /// The special evaluation point `−1` (where `s₋₁`, i.e. `x1`/`x2`, lives).
+    pub fn point_minus1() -> F {
+        -F::one()
     }
 
-    /// The special evaluation point `-2` (where `s₋₂`, i.e. `y1`/`y2`, lives).
-    pub fn point_minus2() -> E::Fr {
-        -(E::Fr::one() + E::Fr::one())
+    /// The special evaluation point `−2` (where `s₋₂`, i.e. `y1`/`y2`, lives).
+    pub fn point_minus2() -> F {
+        -(F::one() + F::one())
     }
 
     /// Field element for a (possibly negative) integer evaluation point.
-    pub fn point(i: i64) -> E::Fr {
+    pub fn point(i: i64) -> F {
         if i >= 0 {
-            E::Fr::from(i as u64)
+            F::from(i as u64)
         } else {
-            -E::Fr::from((-i) as u64)
+            -F::from((-i) as u64)
         }
     }
 
-    /// Sample a degree-`t` polynomial with `f(-1) = s_minus1`, `f(-2) = s_minus2`
-    /// and `t-1` random remaining coefficients.
+    /// Sample a degree-`t` polynomial with `f(−1) = s_minus1`, `f(−2) = s_minus2`
+    /// and `t−1` random remaining coefficients.
     ///
     /// Coefficients `a₂..a_t` are drawn at random; `a₀, a₁` are then solved from
     /// the two linear constraints
     /// ```text
-    ///   a₀ -   a₁ = s₋₁ - R₁,   R₁ = Σ_{k≥2} a_k·(-1)ᵏ
-    ///   a₀ - 2 a₁ = s₋₂ - R₂,   R₂ = Σ_{k≥2} a_k·(-2)ᵏ
+    ///   a₀ −   a₁ = s₋₁ − R₁,   R₁ = Σ_{k≥2} a_k·(−1)ᵏ
+    ///   a₀ − 2 a₁ = s₋₂ − R₂,   R₂ = Σ_{k≥2} a_k·(−2)ᵏ
     /// ```
     pub fn sample<R: Rng>(
         degree: usize,
-        s_minus1: E::Fr,
-        s_minus2: E::Fr,
+        s_minus1: F,
+        s_minus2: F,
         rng: &mut R,
-    ) -> Result<Self, DKGError<E>> {
+    ) -> Result<Self, VssError> {
         if degree < 1 {
-            return Err(DKGError::MSSInsufficientDegree(degree));
+            return Err(VssError::InsufficientDegree(degree));
         }
 
-        let mut coeffs = vec![E::Fr::zero(); degree + 1];
+        let mut coeffs = vec![F::zero(); degree + 1];
         for c in coeffs.iter_mut().take(degree + 1).skip(2) {
-            *c = E::Fr::rand(rng);
+            *c = F::rand(rng);
         }
 
         let m1 = Self::point_minus1();
         let m2 = Self::point_minus2();
-        let mut r1 = E::Fr::zero();
-        let mut r2 = E::Fr::zero();
+        let mut r1 = F::zero();
+        let mut r2 = F::zero();
         for (k, c) in coeffs.iter().enumerate().skip(2) {
             r1 += *c * m1.pow([k as u64]);
             r2 += *c * m2.pow([k as u64]);
         }
 
-        let rhs1 = s_minus1 - r1; // a₀ -  a₁
-        let rhs2 = s_minus2 - r2; // a₀ - 2a₁
-        let a1 = rhs1 - rhs2; // (a₀-a₁) - (a₀-2a₁)
-        let a0 = rhs1 + a1; // a₀ = (a₀-a₁) + a₁
+        let rhs1 = s_minus1 - r1; // a₀ −  a₁
+        let rhs2 = s_minus2 - r2; // a₀ − 2a₁
+        let a1 = rhs1 - rhs2; // (a₀−a₁) − (a₀−2a₁)
+        let a0 = rhs1 + a1; // a₀ = (a₀−a₁) + a₁
         coeffs[0] = a0;
         coeffs[1] = a1;
 
         Ok(Self {
             coeffs,
-            pairing_type: PhantomData,
+            field_type: PhantomData,
         })
     }
 
     /// Evaluate the polynomial at an arbitrary field point (Horner's method).
-    pub fn evaluate(&self, x: E::Fr) -> E::Fr {
-        let mut acc = E::Fr::zero();
+    pub fn evaluate(&self, x: F) -> F {
+        let mut acc = F::zero();
         for c in self.coeffs.iter().rev() {
             acc = acc * x + c;
         }
         acc
     }
 
-    /// Evaluate at an integer point (e.g. a receiver index `j`, or `-1`/`-2`).
-    pub fn evaluate_at(&self, i: i64) -> E::Fr {
+    /// Evaluate at an integer point (e.g. a receiver index `j`, or `−1`/`−2`).
+    pub fn evaluate_at(&self, i: i64) -> F {
         self.evaluate(Self::point(i))
     }
 
-    /// The pinned secret `s₋₁ = f(-1)` (i.e. `x1` for `f`, `x2` for `g`).
-    pub fn secret_minus1(&self) -> E::Fr {
+    /// The pinned secret `s₋₁ = f(−1)` (i.e. `x1` for `f`, `x2` for `g`).
+    pub fn secret_minus1(&self) -> F {
         self.evaluate(Self::point_minus1())
     }
 
-    /// The pinned secret `s₋₂ = f(-2)` (i.e. `y1` for `f`, `y2` for `g`).
-    pub fn secret_minus2(&self) -> E::Fr {
+    /// The pinned secret `s₋₂ = f(−2)` (i.e. `y1` for `f`, `y2` for `g`).
+    pub fn secret_minus2(&self) -> F {
         self.evaluate(Self::point_minus2())
     }
 
     /// Shares `f(1), …, f(n)` for receivers `j ∈ [1,n]`.
-    pub fn shares(&self, n: usize) -> Vec<E::Fr> {
-        (1..=n)
-            .map(|j| self.evaluate(E::Fr::from(j as u64)))
-            .collect()
+    pub fn shares(&self, n: usize) -> Vec<F> {
+        (1..=n).map(|j| self.evaluate(F::from(j as u64))).collect()
     }
 
     /// Lagrange coefficients `λⱼ` for evaluating a polynomial at `target` from
@@ -135,14 +144,11 @@ impl<E: PairingEngine> MSSPolynomial<E> {
     /// `indices` must be distinct (and number at least `t+1` for an exact
     /// recovery of a degree-`t` polynomial; with fewer the result is meaningless,
     /// but only distinctness can be checked here).
-    pub fn lagrange_coefficients(
-        target: E::Fr,
-        indices: &[E::Fr],
-    ) -> Result<Vec<E::Fr>, DKGError<E>> {
+    pub fn lagrange_coefficients(target: F, indices: &[F]) -> Result<Vec<F>, VssError> {
         let mut coeffs = Vec::with_capacity(indices.len());
         for (i, xi) in indices.iter().enumerate() {
-            let mut num = E::Fr::one();
-            let mut den = E::Fr::one();
+            let mut num = F::one();
+            let mut den = F::one();
             for (k, xk) in indices.iter().enumerate() {
                 if i == k {
                     continue;
@@ -150,27 +156,27 @@ impl<E: PairingEngine> MSSPolynomial<E> {
                 num *= target - *xk;
                 den *= *xi - *xk;
             }
-            let den_inv = den.inverse().ok_or(DKGError::MSSBadIndices)?;
+            let den_inv = den.inverse().ok_or(VssError::BadIndices)?;
             coeffs.push(num * den_inv);
         }
         Ok(coeffs)
     }
 
-    /// `λ1ⱼ`: Lagrange coefficients that recover `f(-1)` (the `x1`/`x2` slot).
-    pub fn lambda1(indices: &[E::Fr]) -> Result<Vec<E::Fr>, DKGError<E>> {
+    /// `λ1ⱼ`: Lagrange coefficients that recover `f(−1)` (the `x1`/`x2` slot).
+    pub fn lambda1(indices: &[F]) -> Result<Vec<F>, VssError> {
         Self::lagrange_coefficients(Self::point_minus1(), indices)
     }
 
-    /// `λ2ⱼ`: Lagrange coefficients that recover `f(-2)` (the `y1`/`y2` slot).
-    pub fn lambda2(indices: &[E::Fr]) -> Result<Vec<E::Fr>, DKGError<E>> {
+    /// `λ2ⱼ`: Lagrange coefficients that recover `f(−2)` (the `y1`/`y2` slot).
+    pub fn lambda2(indices: &[F]) -> Result<Vec<F>, VssError> {
         Self::lagrange_coefficients(Self::point_minus2(), indices)
     }
 
     /// Recover `f(target)` from `(index, value)` pairs via Lagrange interpolation.
-    pub fn recover(target: E::Fr, points: &[(E::Fr, E::Fr)]) -> Result<E::Fr, DKGError<E>> {
+    pub fn recover(target: F, points: &[(F, F)]) -> Result<F, VssError> {
         let indices = points.iter().map(|(x, _)| *x).collect::<Vec<_>>();
         let lambdas = Self::lagrange_coefficients(target, &indices)?;
-        let mut acc = E::Fr::zero();
+        let mut acc = F::zero();
         for (lambda, (_, value)) in lambdas.iter().zip(points.iter()) {
             acc += *lambda * value;
         }
@@ -181,11 +187,11 @@ impl<E: PairingEngine> MSSPolynomial<E> {
 #[cfg(test)]
 mod test {
     use super::MSSPolynomial;
-    use ark_bls12_381::{Bls12_381, Fr};
+    use ark_bls12_381::Fr;
     use ark_ff::UniformRand;
     use rand::thread_rng;
 
-    type MSS = MSSPolynomial<Bls12_381>;
+    type MSS = MSSPolynomial<Fr>;
 
     #[test]
     fn test_pinned_points_roundtrip() {

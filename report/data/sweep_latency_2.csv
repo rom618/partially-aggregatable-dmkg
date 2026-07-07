@@ -1,0 +1,9 @@
+series,latency_ms,wall_ms
+no aggregation: broadcast (1 round),0,1.63
+no aggregation: broadcast (1 round),50,52.0712
+no aggregation: broadcast (1 round),100,101.8514
+no aggregation: broadcast (1 round),200,201.7812
+aggregation: tree gossip (log n rounds),0,5.745
+aggregation: tree gossip (log n rounds),50,255.8125
+aggregation: tree gossip (log n rounds),100,505.6694
+aggregation: tree gossip (log n rounds),200,1006.2152

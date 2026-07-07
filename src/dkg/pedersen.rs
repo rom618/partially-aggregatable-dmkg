@@ -1,27 +1,39 @@
-//! Four-generator Pedersen commitments for the (x1,x2,y1,y2) layer.
+//! Four-generator Pedersen commitments + masks for the `(x1,x2,y1,y2)` layer
+//! (paper §4.3 Phases 1–2).
 //!
-//! Each dealer encodes two secrets and two masks as four degree-`t` Franklin-Yung
-//! polynomials: f and g pin the secrets (f(-1)=x1, f(-2)=y1; g(-1)=x2, g(-2)=y2),
-//! while f' and g' pin the masks. For every coefficient k it publishes a combined
-//! commitment over four NUMS generators with unknown mutual discrete logs:
+//! Per dealer `Pᵢ`, two secrets and two masks are encoded as four degree-`t`
+//! Franklin–Yung polynomials (see [`crate::dkg::mss`]):
+//!
+//! | Polynomial | Pins                         | Coeff | Role          |
+//! |------------|------------------------------|-------|---------------|
+//! | `f`        | `f(−1)=x1`, `f(−2)=y1`       | `aₖ`  | secret #1     |
+//! | `g`        | `g(−1)=x2`, `g(−2)=y2`       | `a'ₖ` | secret #2     |
+//! | `f'`       | `f'(−1)=β1`, `f'(−2)=β2`     | `bₖ`  | mask for `f`  |
+//! | `g'`       | `g'(−1)=β3`, `g'(−2)=β4`     | `b'ₖ` | mask for `g`  |
+//!
+//! For each coefficient index `k ∈ [0,t]` the dealer publishes a combined
+//! Pedersen commitment over four generators with unknown mutual discrete logs:
 //!
 //! ```text
-//! CM_k = g1^{a_k} · h1^{b_k} · g2^{a'_k} · h2^{b'_k}
+//! CMₖ = g1^{aₖ} · h1^{bₖ} · g2^{a'ₖ} · h2^{b'ₖ}
 //! ```
 //!
-//! Receiver j gets (sf, sf', sg, sg') = (f(j), f'(j), g(j), g'(j)) and checks
+//! Receiver `j ∈ [1,n]` gets the share quadruple
+//! `(sf,sf',sg,sg') = (f(j),f'(j),g(j),g'(j))` and checks **Eq. (1)**:
 //!
 //! ```text
-//! g1^{sf} · h1^{sf'} · g2^{sg} · h2^{sg'} == prod_{k=0..t} CM_k^{j^k}
+//! g1^{sf} · h1^{sf'} · g2^{sg} · h2^{sg'}  ==  ∏_{k=0}^{t} CMₖ^{ jᵏ }
 //! ```
 //!
-//! Shares are in the clear here; encryption to each receiver is layered on
-//! separately.
+//! This layer uses **only plain group operations** (no pairing), so it is generic
+//! over any prime-order `C: ProjectiveCurve`. The `(x1,x2,y1,y2)` DMKGs instantiate
+//! it on a non-pairing curve (Jubjub); the partially-aggregatable protocol
+//! instantiates it on BLS12-381's `G1`, to share the curve of its PVSS `z` layer.
 
-use crate::dkg::{errors::DKGError, mss::MSSPolynomial};
+use crate::dkg::{errors::VssError, mss::MSSPolynomial};
 use crate::signature::utils::hash::hash_to_group;
-use ark_ec::{msm::VariableBaseMSM, PairingEngine, ProjectiveCurve};
-use ark_ff::{One, PrimeField, UniformRand, Zero};
+use ark_ec::{msm::VariableBaseMSM, ProjectiveCurve};
+use ark_ff::{One, PrimeField, UniformRand};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Read, SerializationError, Write};
 use rand::Rng;
 
@@ -29,23 +41,26 @@ use rand::Rng;
 /// (blake2s personalization must be exactly 8 bytes).
 const PERSONALIZATION: &[u8] = b"DMKGPEDR";
 
-/// The four Pedersen generators `g1, g2, h1, h2` in G1 with unknown pairwise
-/// discrete logs. `g1, g2` commit to the two secrets, `h1, h2` to their masks.
+/// The four Pedersen generators `g1, g2, h1, h2` with **unknown pairwise
+/// discrete logs**. `g1, g2` commit to the two secrets, `h1, h2`
+/// to their masks.
 #[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
-pub struct PedersenGenerators<E: PairingEngine> {
-    pub g1: E::G1Affine,
-    pub g2: E::G1Affine,
-    pub h1: E::G1Affine,
-    pub h2: E::G1Affine,
+pub struct PedersenGenerators<C: ProjectiveCurve> {
+    pub g1: C::Affine,
+    pub g2: C::Affine,
+    pub h1: C::Affine,
+    pub h2: C::Affine,
 }
 
-impl<E: PairingEngine> PedersenGenerators<E> {
+impl<C: ProjectiveCurve> PedersenGenerators<C> {
     /// Derive the four generators by hashing fixed nothing-up-my-sleeve seeds to
     /// the curve. Because each is produced by hash-to-curve, no party knows the
     /// discrete log of any generator with respect to another.
-    pub fn setup() -> Result<Self, DKGError<E>> {
-        let derive = |seed: &[u8]| -> Result<E::G1Affine, DKGError<E>> {
-            Ok(hash_to_group::<E::G1Affine>(PERSONALIZATION, seed)?.into_affine())
+    pub fn setup() -> Result<Self, VssError> {
+        let derive = |seed: &[u8]| -> Result<C::Affine, VssError> {
+            Ok(hash_to_group::<C::Affine>(PERSONALIZATION, seed)
+                .map_err(|_| VssError::Malformed("hash-to-curve failed"))?
+                .into_affine())
         };
         Ok(Self {
             g1: derive(b"pedersen-g1")?,
@@ -57,7 +72,13 @@ impl<E: PairingEngine> PedersenGenerators<E> {
 
     /// Compute a single combined Pedersen commitment
     /// `g1^a · h1^b · g2^{a'} · h2^{b'}`.
-    fn commit(&self, a: E::Fr, b: E::Fr, a_prime: E::Fr, b_prime: E::Fr) -> E::G1Affine {
+    fn commit(
+        &self,
+        a: C::ScalarField,
+        b: C::ScalarField,
+        a_prime: C::ScalarField,
+        b_prime: C::ScalarField,
+    ) -> C::Affine {
         let bases = [self.g1, self.h1, self.g2, self.h2];
         let scalars = [
             a.into_repr(),
@@ -69,57 +90,59 @@ impl<E: PairingEngine> PedersenGenerators<E> {
     }
 }
 
-/// One receiver's share quadruple `(sf, sf', sg, sg') = (f(j),f'(j),g(j),g'(j))`,
-/// in the clear here; encrypted to the receiver separately.
+/// One receiver's share quadruple `(sf, sf', sg, sg') = (f(j),f'(j),g(j),g'(j))`.
+/// In the clear at Phase 3; encrypted to `Pⱼ` at Phase 4.
 #[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
-pub struct PedersenShare<E: PairingEngine> {
-    pub sf: E::Fr,
-    pub sf_prime: E::Fr,
-    pub sg: E::Fr,
-    pub sg_prime: E::Fr,
+pub struct PedersenShare<C: ProjectiveCurve> {
+    pub sf: C::ScalarField,
+    pub sf_prime: C::ScalarField,
+    pub sg: C::ScalarField,
+    pub sg_prime: C::ScalarField,
 }
 
-/// A dealer's public Pedersen-layer output: the per-coefficient commitments `CM_k`
-/// (`k in [0,t]`) and the per-receiver share quadruples (index `i` corresponds to
-/// receiver `j = i + 1`).
+/// A dealer's public Pedersen-layer output (paper §4.3 Phase 1): the per-coefficient
+/// commitments `CMₖ` (`k ∈ [0,t]`) and the per-receiver share quadruples
+/// (index `i` corresponds to receiver `j = i + 1`).
 #[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
-pub struct PedersenDistribution<E: PairingEngine> {
-    pub commitments: Vec<E::G1Affine>,
-    pub shares: Vec<PedersenShare<E>>,
+pub struct PedersenDistribution<C: ProjectiveCurve> {
+    pub commitments: Vec<C::Affine>,
+    pub shares: Vec<PedersenShare<C>>,
 }
 
 /// The dealer-local secrets behind a [`PedersenDistribution`]: the two pinned
 /// secrets and the four polynomials. Kept private (no serialization).
 #[derive(Clone, Debug)]
-pub struct PedersenDealerSecrets<E: PairingEngine> {
-    pub x1: E::Fr,
-    pub x2: E::Fr,
-    pub y1: E::Fr,
-    pub y2: E::Fr,
-    pub f: MSSPolynomial<E>,
-    pub g: MSSPolynomial<E>,
-    pub f_prime: MSSPolynomial<E>,
-    pub g_prime: MSSPolynomial<E>,
+pub struct PedersenDealerSecrets<C: ProjectiveCurve> {
+    pub x1: C::ScalarField,
+    pub x2: C::ScalarField,
+    pub y1: C::ScalarField,
+    pub y2: C::ScalarField,
+    pub f: MSSPolynomial<C::ScalarField>,
+    pub g: MSSPolynomial<C::ScalarField>,
+    pub f_prime: MSSPolynomial<C::ScalarField>,
+    pub g_prime: MSSPolynomial<C::ScalarField>,
 }
 
-impl<E: PairingEngine> PedersenDistribution<E> {
+impl<C: ProjectiveCurve> PedersenDistribution<C> {
     /// Deal with caller-chosen secrets `x1,x2,y1,y2`. Blinds `β1..β4` and the
     /// free polynomial coefficients are sampled internally.
-    ///
-    /// (The paper also lists `β0`; it is not consumed by this commitment layer -
-    /// only `β1..β4` pin the two mask polynomials - so it is not drawn here.)
     pub fn deal_with_secrets<R: Rng>(
-        generators: &PedersenGenerators<E>,
+        generators: &PedersenGenerators<C>,
         degree: usize,
         num_receivers: usize,
-        secrets: (E::Fr, E::Fr, E::Fr, E::Fr),
+        secrets: (
+            C::ScalarField,
+            C::ScalarField,
+            C::ScalarField,
+            C::ScalarField,
+        ),
         rng: &mut R,
-    ) -> Result<(Self, PedersenDealerSecrets<E>), DKGError<E>> {
+    ) -> Result<(Self, PedersenDealerSecrets<C>), VssError> {
         let (x1, x2, y1, y2) = secrets;
-        let beta1 = E::Fr::rand(rng);
-        let beta2 = E::Fr::rand(rng);
-        let beta3 = E::Fr::rand(rng);
-        let beta4 = E::Fr::rand(rng);
+        let beta1 = C::ScalarField::rand(rng);
+        let beta2 = C::ScalarField::rand(rng);
+        let beta3 = C::ScalarField::rand(rng);
+        let beta4 = C::ScalarField::rand(rng);
 
         let f = MSSPolynomial::sample(degree, x1, y1, rng)?;
         let g = MSSPolynomial::sample(degree, x2, y2, rng)?;
@@ -169,33 +192,33 @@ impl<E: PairingEngine> PedersenDistribution<E> {
 
     /// Deal with freshly sampled random secrets `x1,x2,y1,y2`.
     pub fn deal<R: Rng>(
-        generators: &PedersenGenerators<E>,
+        generators: &PedersenGenerators<C>,
         degree: usize,
         num_receivers: usize,
         rng: &mut R,
-    ) -> Result<(Self, PedersenDealerSecrets<E>), DKGError<E>> {
+    ) -> Result<(Self, PedersenDealerSecrets<C>), VssError> {
         let secrets = (
-            E::Fr::rand(rng),
-            E::Fr::rand(rng),
-            E::Fr::rand(rng),
-            E::Fr::rand(rng),
+            C::ScalarField::rand(rng),
+            C::ScalarField::rand(rng),
+            C::ScalarField::rand(rng),
+            C::ScalarField::rand(rng),
         );
         Self::deal_with_secrets(generators, degree, num_receivers, secrets, rng)
     }
 
-    /// Receiver-side check of Eq. (1) for receiver `j` (1-based) against a
+    /// Receiver-side check of **Eq. (1)** for receiver `j` (1-based) against a
     /// share quadruple, rewritten as a single multi-scalar-mul that must vanish:
     ///
     /// ```text
-    /// g1^{sf}·h1^{sf'}·g2^{sg}·h2^{sg'} · ∏_k CMₖ^{-jᵏ}  ==  1
+    /// g1^{sf}·h1^{sf'}·g2^{sg}·h2^{sg'} · ∏_k CMₖ^{−jᵏ}  ==  1
     /// ```
     pub fn verify_share(
-        generators: &PedersenGenerators<E>,
-        commitments: &[E::G1Affine],
+        generators: &PedersenGenerators<C>,
+        commitments: &[C::Affine],
         j: usize,
-        share: &PedersenShare<E>,
-    ) -> Result<(), DKGError<E>> {
-        let j_fr = E::Fr::from(j as u64);
+        share: &PedersenShare<C>,
+    ) -> Result<(), VssError> {
+        let j_fr = C::ScalarField::from(j as u64);
 
         let mut bases = vec![generators.g1, generators.h1, generators.g2, generators.h2];
         bases.extend_from_slice(commitments);
@@ -206,7 +229,7 @@ impl<E: PairingEngine> PedersenDistribution<E> {
             share.sg.into_repr(),
             share.sg_prime.into_repr(),
         ];
-        let mut power = E::Fr::one();
+        let mut power = C::ScalarField::one();
         for _ in 0..commitments.len() {
             scalars.push((-power).into_repr());
             power *= j_fr;
@@ -214,14 +237,14 @@ impl<E: PairingEngine> PedersenDistribution<E> {
 
         let product = VariableBaseMSM::multi_scalar_mul(&bases, &scalars);
         if !product.is_zero() {
-            return Err(DKGError::PedersenShareCheckError(j));
+            return Err(VssError::ShareCheck(j));
         }
         Ok(())
     }
 
     /// Verify every receiver's share (`j = 1..=shares.len()`) against the
     /// commitments. Returns the first failing receiver, if any.
-    pub fn verify_all(&self, generators: &PedersenGenerators<E>) -> Result<(), DKGError<E>> {
+    pub fn verify_all(&self, generators: &PedersenGenerators<C>) -> Result<(), VssError> {
         for (i, share) in self.shares.iter().enumerate() {
             Self::verify_share(generators, &self.commitments, i + 1, share)?;
         }
@@ -233,14 +256,14 @@ impl<E: PairingEngine> PedersenDistribution<E> {
 mod test {
     use super::{PedersenDistribution, PedersenGenerators};
     use crate::dkg::mss::MSSPolynomial;
-    use ark_bls12_381::{Bls12_381, Fr, G1Projective};
+    use ark_bls12_381::{Fr, G1Projective};
     use ark_ec::ProjectiveCurve;
     use ark_ff::UniformRand;
     use rand::thread_rng;
 
-    type Pedersen = PedersenDistribution<Bls12_381>;
-    type Gens = PedersenGenerators<Bls12_381>;
-    type MSS = MSSPolynomial<Bls12_381>;
+    type Pedersen = PedersenDistribution<G1Projective>;
+    type Gens = PedersenGenerators<G1Projective>;
+    type MSS = MSSPolynomial<Fr>;
 
     #[test]
     fn test_generators_distinct() {

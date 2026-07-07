@@ -1,31 +1,45 @@
-//! End-to-end Distributed Multi-Key Generation node.
+//! Phase 6 — end-to-end Distributed Multi-Key Generation (DMKG) node.
 //!
-//! A run produces the traceable key pair
+//! A DMKG run produces the traceable key pair of the paper:
 //!
 //! ```text
 //! sk = (x1, x2, y1, y2, z)
-//! pk = (c1, c2, c3) = (g1^x1·g2^x2, g1^y1·g2^y2, g1^z)
+//! pk = (c1, c2, c3) = ( g1^{x1}·g2^{x2},  g1^{y1}·g2^{y2},  g1^{z} )
 //! ```
 //!
-//! by combining two sharing layers over the qualified set: the aggregatable
-//! SCRAPE PVSS for `z` (a tampered contribution puts its dealer in `Qagg`), and the
-//! four-generator Pedersen / Franklin-Yung layer for `(x1,x2,y1,y2)` with encrypted
-//! shares and complaint handling. To bind `z` to the Pedersen generator `g1`, each
-//! dealer also publishes `c3_i = g1^{z_i}` alongside its SCRAPE commitment.
+//! by running the **two independent sharing machineries** per dealer and combining
+//! their outputs over the qualified set:
 //!
-//! Since the encrypted shares are group elements, each receiver holds `g1^{f(j)}`
-//! and `g2^{g(j)}`. Summing over the qualified dealers and interpolating in the
-//! exponent at the special points recovers c1 and c2:
+//! * `z` — the upstream Gurkan **aggregatable SCRAPE PVSS** ([`crate::dkg::node`],
+//!   [`crate::dkg::aggregator`]); a tampered contribution lands its dealer in
+//!   `Qagg` (Phase 1).
+//! * `(x1,x2,y1,y2)` — the four-generator **Pedersen / Franklin–Yung** layer
+//!   ([`crate::dkg::pedersen`]) with lifted-ElGamal share encryption
+//!   ([`crate::dkg::encryption`]) and simplified complaint management
+//!   ([`crate::dkg::complaint`]).
+//!
+//! `g1, g2` are the Pedersen NUMS generators (`pk` ties `g1,g2` to the
+//! same group). The `z` component is bound to the same `g1` by having each dealer
+//! also publish `c3ᵢ = g1^{zᵢ}` alongside its SCRAPE commitment `c_i = ĝ^{zᵢ}`
+//! (the SCRAPE layer still verifies/aggregates `z` and feeds `Qagg`).
+//!
+//! ## Reconstruction (in the exponent)
+//!
+//! Because the share encryption is EC-native (option (B), [`crate::dkg::encryption`]),
+//! receivers hold **group-element** shares `g1^{fᵢ(j)}`, `g2^{gᵢ(j)}`. Summing over
+//! the qualified dealers gives, per receiver `j`,
+//! `Mf(j)=g1^{F(j)}`, `Mg(j)=g2^{G(j)}` with `F=Σfᵢ`, `G=Σgᵢ`. Lagrange-in-exponent
+//! at the special points then reconstructs the public-key components:
 //!
 //! ```text
-//! c1 = sum_j lambda1_j·(Mf(j) + Mg(j)) = g1^x1·g2^x2
-//! c2 = sum_j lambda2_j·(Mf(j) + Mg(j)) = g1^y1·g2^y2
+//! c1 = Σⱼ λ1ⱼ·Mf(j) + Σⱼ λ1ⱼ·Mg(j) = g1^{x1}·g2^{x2}
+//! c2 = Σⱼ λ2ⱼ·Mf(j) + Σⱼ λ2ⱼ·Mg(j) = g1^{y1}·g2^{y2}
 //! ```
 
 use crate::{
     dkg::{
         encryption::{ElGamalBase, ElGamalKeypair, EncryptedPedersenShare},
-        errors::DKGError,
+        errors::{DKGError, VssError},
         mss::MSSPolynomial,
         node::Node,
         participant::ParticipantState,
@@ -59,7 +73,7 @@ pub struct DMKGContribution<
     /// Pedersen commitments `CMₖ` for the `(x1,x2,y1,y2)` layer.
     pub commitments: Vec<E::G1Affine>,
     /// Encrypted share quadruples, one per receiver `j ∈ [1,n]`.
-    pub encrypted_shares: Vec<EncryptedPedersenShare<E>>,
+    pub encrypted_shares: Vec<EncryptedPedersenShare<E::G1Projective>>,
     /// This dealer's contributions to the public key: `(g1^{x1ᵢ}g2^{x2ᵢ},
     /// g1^{y1ᵢ}g2^{y2ᵢ}, g1^{zᵢ})`.
     pub c1_i: E::G1Affine,
@@ -95,26 +109,26 @@ where
 }
 
 /// Reconstruct `(c1, c2)` from `t+1` receivers' aggregated group-element shares
-/// via Lagrange-in-exponent at the Franklin-Yung special points `-1` and `-2`.
+/// via Lagrange-in-exponent at the Franklin–Yung special points `−1` and `−2`.
 ///
 /// Each entry is `(j, Mf(j), Mg(j))` with `Mf(j)=g1^{F(j)}`, `Mg(j)=g2^{G(j)}`.
-pub fn reconstruct_pk_components<E: PairingEngine>(
-    receivers: &[(usize, E::G1Affine, E::G1Affine)],
-) -> Result<(E::G1Affine, E::G1Affine), DKGError<E>> {
-    let indices: Vec<E::Fr> = receivers
+pub fn reconstruct_pk_components<C: ProjectiveCurve>(
+    receivers: &[(usize, C::Affine, C::Affine)],
+) -> Result<(C::Affine, C::Affine), VssError> {
+    let indices: Vec<C::ScalarField> = receivers
         .iter()
-        .map(|(j, _, _)| MSSPolynomial::<E>::point(*j as i64))
+        .map(|(j, _, _)| MSSPolynomial::<C::ScalarField>::point(*j as i64))
         .collect();
-    let lambda1 = MSSPolynomial::<E>::lambda1(&indices)?;
-    let lambda2 = MSSPolynomial::<E>::lambda2(&indices)?;
+    let lambda1 = MSSPolynomial::<C::ScalarField>::lambda1(&indices)?;
+    let lambda2 = MSSPolynomial::<C::ScalarField>::lambda2(&indices)?;
 
-    let mut c1 = E::G1Projective::zero();
-    let mut c2 = E::G1Projective::zero();
+    let mut c1 = C::zero();
+    let mut c2 = C::zero();
     for (idx, (_, mf, mg)) in receivers.iter().enumerate() {
-        // c1 uses λ1 (recovers value at -1: x1, x2).
+        // c1 uses λ1 (recovers value at −1: x1, x2).
         c1 += mf.mul(lambda1[idx].into_repr());
         c1 += mg.mul(lambda1[idx].into_repr());
-        // c2 uses λ2 (recovers value at -2: y1, y2).
+        // c2 uses λ2 (recovers value at −2: y1, y2).
         c2 += mf.mul(lambda2[idx].into_repr());
         c2 += mg.mul(lambda2[idx].into_repr());
     }
@@ -129,7 +143,7 @@ pub struct DMKGDealer<
     SSIG: BatchVerifiableSignatureScheme<PublicKey = E::G2Affine, Secret = E::Fr>,
 > {
     pub node: Node<E, SPOK, SSIG>,
-    pub elgamal: ElGamalKeypair<E>,
+    pub elgamal: ElGamalKeypair<E::G1Projective>,
 }
 
 /// Produce one dealer's full contribution (both layers) plus the dealer-local
@@ -140,15 +154,15 @@ pub struct DMKGDealer<
 #[allow(clippy::type_complexity)]
 pub fn deal<E, SPOK, SSIG, R>(
     dealer: &mut DMKGDealer<E, SPOK, SSIG>,
-    generators: &PedersenGenerators<E>,
-    base: &ElGamalBase<E>,
+    generators: &PedersenGenerators<E::G1Projective>,
+    base: &ElGamalBase<E::G1Projective>,
     receiver_pks: &[E::G1Affine],
     rng: &mut R,
 ) -> Result<
     (
         DMKGContribution<E, SPOK, SSIG>,
-        PedersenDealerSecrets<E>,
-        PedersenDistribution<E>,
+        PedersenDealerSecrets<E::G1Projective>,
+        PedersenDistribution<E::G1Projective>,
     ),
     DKGError<E>,
 >
@@ -198,7 +212,7 @@ where
     };
     dealer.node.dealer.participant.state = ParticipantState::DealerShared;
 
-    // ---- (x1,x2,y1,y2) layer: Pedersen / Franklin-Yung ----
+    // ---- (x1,x2,y1,y2) layer: Pedersen / Franklin–Yung ----
     let (distribution, secrets) = PedersenDistribution::deal(generators, degree, n, rng)?;
 
     let encrypted_shares = (0..n)
@@ -248,7 +262,7 @@ mod test {
         signature::bls::{srs::SRS as BLSSRS, BLSSignature, BLSSignatureG1, BLSSignatureG2},
         signature::scheme::SignatureScheme,
     };
-    use ark_bls12_381::{Bls12_381, G2Projective};
+    use ark_bls12_381::{Bls12_381, G1Projective, G2Projective};
     use ark_ff::UniformRand;
     use rand::thread_rng;
     use std::marker::PhantomData;
@@ -280,15 +294,15 @@ mod test {
             u_1,
             degree,
         };
-        let generators = PedersenGenerators::<E>::setup().unwrap();
-        let base = ElGamalBase::<E>::setup().unwrap();
+        let generators = PedersenGenerators::<G1Projective>::setup().unwrap();
+        let base = ElGamalBase::<G1Projective>::setup().unwrap();
 
         // Build dealers (sig keypair + elgamal keypair).
         let mut sig_keys = vec![];
         let mut elgamal = vec![];
         for _ in 0..n {
             sig_keys.push(bls_sig.generate_keypair(rng).unwrap());
-            elgamal.push(ElGamalKeypair::<E>::generate(&base, rng));
+            elgamal.push(ElGamalKeypair::<G1Projective>::generate(&base, rng));
         }
         let participants = (0..n)
             .map(|i| {
@@ -323,8 +337,9 @@ mod test {
 
         // ---- Distribution ----
         let mut contributions: BTreeMap<usize, DMKGContribution<E, SPOK, SSIG>> = BTreeMap::new();
-        let mut all_secrets: BTreeMap<usize, PedersenDealerSecrets<E>> = BTreeMap::new();
-        let mut all_distributions: BTreeMap<usize, PedersenDistribution<E>> = BTreeMap::new();
+        let mut all_secrets: BTreeMap<usize, PedersenDealerSecrets<G1Projective>> = BTreeMap::new();
+        let mut all_distributions: BTreeMap<usize, PedersenDistribution<G1Projective>> =
+            BTreeMap::new();
         for i in 0..n {
             let mut dealer = DMKGDealer {
                 node: make_node(i),
@@ -436,7 +451,7 @@ mod test {
         }
         // Use exactly t+1 receivers.
         let subset = &receiver_msgs[..degree + 1];
-        let (c1_rec, c2_rec) = reconstruct_pk_components::<E>(subset).unwrap();
+        let (c1_rec, c2_rec) = reconstruct_pk_components::<G1Projective>(subset).unwrap();
         assert_eq!(c1_rec, pk.c1, "reconstructed c1 matches aggregated pk");
         assert_eq!(c2_rec, pk.c2, "reconstructed c2 matches aggregated pk");
 

@@ -384,8 +384,8 @@ mod test {
         }
     }
 
-    // A contributor whose PVSS share fails verification is recorded in Qagg;
-    // honest contributors are not.
+    // Phase 1: a contributor whose `z`/PVSS share fails verification is recorded
+    // in the aggregator's `Qagg`; honest contributors are not (paper §2.1).
     #[test]
     fn test_qagg_records_dishonest_contributor() {
         const NODES: usize = 4;

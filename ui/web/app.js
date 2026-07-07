@@ -309,7 +309,7 @@ function render(s) {
       r.textContent = "reconstructed from t+1 ✓";
     } else if (s.publicKey.reconstructedOk === false) {
       r.className = "badge bad";
-      r.textContent = "reconstruction mismatch ✗";
+      r.textContent = "key generation failed ✗ (see log)";
     } else {
       r.className = "badge";
       r.textContent = "";

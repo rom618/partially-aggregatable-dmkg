@@ -1,9 +1,12 @@
-//! Phase-steppable orchestration of the DMKG for the interactive UI.
+//! Interactive, phase-steppable orchestration of the partially aggregatable DMKG,
+//! for the teaching/inspection UI.
 //!
-//! `DkgSession` drives the `crate::dkg::*` machinery one phase at a time and
-//! exposes a `Snapshot` describing, per participant, which state is public (on the
-//! broadcast channel) and which is private. It instantiates BLS12-381 directly and
-//! only sequences and renders the protocol; the crypto lives in the dkg modules.
+//! [`DkgSession`] drives the real `crate::dkg::*` machinery one phase at a time and
+//! exposes a [`Snapshot`] of plain data describing, per participant, which state is
+//! public (broadcast channel / transcript) and which is private (known only
+//! to that participant). It instantiates BLS12-381 concretely - it is a demo
+//! orchestrator, not part of the generic protocol. The cryptography itself is left
+//! entirely to the underlying modules; this layer only sequences and renders it.
 
 use crate::{
     dkg::{
@@ -206,7 +209,7 @@ struct Party {
     malice: Malice,
     sig_sk: Fr,
     sig_pk: G2Affine,
-    elgamal: ElGamalKeypair<E>,
+    elgamal: ElGamalKeypair<G1Projective>,
     // Filled at Distribution (private):
     z_i: Option<Fr>,
     x1: Option<Fr>,
@@ -214,7 +217,7 @@ struct Party {
     y1: Option<Fr>,
     y2: Option<Fr>,
     // Filled at Verification (private to this receiver):
-    received: Vec<Option<RecoveredShareMessages<E>>>,
+    received: Vec<Option<RecoveredShareMessages<G1Projective>>>,
     received_ok: Vec<Option<bool>>,
     accumulated_z: Option<G2Affine>,
     /// Whether this participant verified & approved the final broadcast
@@ -302,8 +305,8 @@ pub struct DkgSession {
     config: Config<E>,
     scheme_pok: SPOK,
     scheme_sig: SSIG,
-    generators: PedersenGenerators<E>,
-    base: ElGamalBase<E>,
+    generators: PedersenGenerators<G1Projective>,
+    base: ElGamalBase<G1Projective>,
     participants_map: BTreeMap<usize, Participant<E, SSIG>>,
     receiver_pks: Vec<<E as PairingEngine>::G1Affine>,
 
@@ -311,7 +314,7 @@ pub struct DkgSession {
     phase: Phase,
 
     contributions: BTreeMap<usize, DMKGContribution<E, SPOK, SSIG>>,
-    distributions: BTreeMap<usize, PedersenDistribution<E>>,
+    distributions: BTreeMap<usize, PedersenDistribution<G1Projective>>,
     qagg: BTreeSet<usize>,
     complaints: Vec<Complaint>,
     qual: BTreeSet<usize>,
@@ -382,15 +385,15 @@ impl DkgSession {
             u_1,
             degree,
         };
-        let generators = PedersenGenerators::<E>::setup().map_err(|e| e.to_string())?;
-        let base = ElGamalBase::<E>::setup().map_err(|e| e.to_string())?;
+        let generators = PedersenGenerators::<G1Projective>::setup().map_err(|e| e.to_string())?;
+        let base = ElGamalBase::<G1Projective>::setup().map_err(|e| e.to_string())?;
 
         let mut parties = Vec::with_capacity(n);
         for id in 0..n {
             let (sig_sk, sig_pk) = scheme_sig
                 .generate_keypair(rng)
                 .map_err(|e| e.to_string())?;
-            let elgamal = ElGamalKeypair::<E>::generate(&base, rng);
+            let elgamal = ElGamalKeypair::<G1Projective>::generate(&base, rng);
             parties.push(Party {
                 malice: malice.get(&id).copied().unwrap_or(Malice::Honest),
                 sig_sk,
@@ -570,7 +573,7 @@ impl DkgSession {
         levels
     }
 
-    // ---- z-aggregation tree (one advance per level) --------------------------
+    // ---- Phase 2: z-aggregation tree (one advance per level) -----------------
 
     /// Called from Distribution: verify all PVSS shares (leaf level 0), build
     /// Qagg, store the aggregated transcript, set up the tree plan.
@@ -733,7 +736,7 @@ impl DkgSession {
             .and_then(|node| node.aggregator)
     }
 
-    // ---- Distribution --------------------------------------------------------
+    // ---- Phase 1: Distribution -----------------------------------------------
     fn do_distribution(&mut self) -> Result<(), String> {
         let rng = &mut thread_rng();
         let n = self.n;
@@ -864,7 +867,7 @@ impl DkgSession {
         Ok(())
     }
 
-    // ---- Pedersen verification (after z-aggregation is done) -----------------
+    // ---- Phase 3: Pedersen verification (called after z-aggregation is done) ---
     fn do_pedersen_verification(&mut self) -> Result<(), String> {
         let n = self.n;
 
@@ -903,7 +906,7 @@ impl DkgSession {
         Ok(())
     }
 
-    // ---- Complaint resolution ------------------------------------------------
+    // ---- Phase 3: Complaint resolution ---------------------------------------
     fn do_complaints(&mut self) -> Result<(), String> {
         let rng = &mut thread_rng();
         let n = self.n;
@@ -953,50 +956,90 @@ impl DkgSession {
         Ok(())
     }
 
-    // ---- Key generation + reconstruction -------------------------------------
+    // ---- Phase 4: Key generation + reconstruction ----------------------------
     fn do_key_generation(&mut self) -> Result<(), String> {
+        self.phase = Phase::KeyGeneration;
+
         if self.qual.is_empty() {
+            self.reconstructed_ok = Some(false);
             self.log
-                .push("KeyGeneration: QUAL is empty - no key can be formed.".to_string());
-            self.phase = Phase::KeyGeneration;
+                .push("KeyGeneration: FAILED - QUAL is empty, no key can be formed.".to_string());
             return Ok(());
         }
+
+        // An aggregate over the honest QUAL can always be formed for inspection,
+        // but it is only a *valid, secure* key when the adversary stayed within the
+        // protocol's bound. Compute it first so the UI can show the parts either way.
         let pk = aggregate_public_key(&self.contributions, &self.qual);
+        self.pk = Some(pk.clone());
+
+        // The DMKG is secure with threshold `t` only when the adversary corrupts at
+        // most `t-1` participants (paper §4.1 / BTSOF §4.2: `t-1 < n/2`, so the
+        // honest parties are the majority). If more than `t-1` are malicious the
+        // committee is no longer honest-majority for degree `t`: secrecy and
+        // robustness are both lost, so key generation is considered to FAIL.
+        let tolerated = self.degree.saturating_sub(1);
+        let num_malicious = self.malice.len();
+        if num_malicious > tolerated {
+            self.reconstructed_ok = Some(false);
+            self.log.push(format!(
+                "KeyGeneration: FAILED - {} malicious participants exceed the tolerated \
+                 bound t-1={} (the protocol needs t-1 < n/2). For threshold t={} the \
+                 committee is not honest-majority, so no secure key is produced.",
+                num_malicious, tolerated, self.degree
+            ));
+            return Ok(());
+        }
+
         self.log
             .push("KeyGeneration: aggregated pk = (c1,c2,c3) over QUAL.".to_string());
 
-        // Reconstruct (c1,c2) from t+1 receivers' aggregated group-element shares.
-        if self.degree < self.n {
-            let mut receiver_msgs = vec![];
-            for j in 0..self.n {
-                let mut mf = G1Projective::zero();
-                let mut mg = G1Projective::zero();
-                for id in self.qual.iter() {
-                    if let Some(rec) = &self.parties[j].received[*id] {
-                        mf += rec.m_sf.into_projective();
-                        mg += rec.m_sg.into_projective();
-                    }
+        // Reconstruct (c1,c2) from `t+1` HONEST receivers' group-element shares. A
+        // corrupted receiver cannot be relied on to contribute a valid decrypted
+        // share, so reconstruction draws only on honest participants; at least
+        // `t+1` of them are required to interpolate the degree-`t` sharing.
+        let need = self.degree + 1;
+        let honest_receivers: Vec<usize> = (0..self.n)
+            .filter(|j| !self.parties[*j].malice.is_malicious())
+            .collect();
+        if honest_receivers.len() < need {
+            self.reconstructed_ok = Some(false);
+            self.log.push(format!(
+                "KeyGeneration: FAILED - only {} honest participants, need t+1={} to \
+                 reconstruct the threshold key.",
+                honest_receivers.len(),
+                need
+            ));
+            return Ok(());
+        }
+
+        let mut receiver_msgs = vec![];
+        for &j in honest_receivers.iter().take(need) {
+            let mut mf = G1Projective::zero();
+            let mut mg = G1Projective::zero();
+            for id in self.qual.iter() {
+                if let Some(rec) = &self.parties[j].received[*id] {
+                    mf += rec.m_sf.into_projective();
+                    mg += rec.m_sg.into_projective();
                 }
-                receiver_msgs.push((j + 1, mf.into_affine(), mg.into_affine()));
             }
-            let subset = &receiver_msgs[..self.degree + 1];
-            match reconstruct_pk_components::<E>(subset) {
-                Ok((c1, c2)) => {
-                    let ok = c1 == pk.c1 && c2 == pk.c2;
-                    self.reconstructed_ok = Some(ok);
-                    self.log.push(format!(
-                        "KeyGeneration: reconstructed (c1,c2) from t+1={} receivers - match: {}.",
-                        self.degree + 1,
-                        ok
-                    ));
-                }
-                Err(e) => self
-                    .log
-                    .push(format!("KeyGeneration: reconstruction failed: {}.", e)),
+            receiver_msgs.push((j + 1, mf.into_affine(), mg.into_affine()));
+        }
+        match reconstruct_pk_components::<G1Projective>(&receiver_msgs) {
+            Ok((c1, c2)) => {
+                let ok = c1 == pk.c1 && c2 == pk.c2;
+                self.reconstructed_ok = Some(ok);
+                self.log.push(format!(
+                    "KeyGeneration: reconstructed (c1,c2) from t+1={} honest receivers - match: {}.",
+                    need, ok
+                ));
+            }
+            Err(e) => {
+                self.reconstructed_ok = Some(false);
+                self.log
+                    .push(format!("KeyGeneration: reconstruction failed: {}.", e));
             }
         }
-        self.pk = Some(pk);
-        self.phase = Phase::KeyGeneration;
         Ok(())
     }
 
@@ -1552,6 +1595,49 @@ mod test {
         for h in [0usize, 2, 3, 4] {
             assert!(snap.qual.contains(&h));
         }
+        assert_eq!(
+            snap.public_key.as_ref().unwrap().reconstructed_ok,
+            Some(true)
+        );
+    }
+
+    // When more participants are malicious than the threshold tolerates (> t-1),
+    // key generation must report FAILURE rather than silently "reconstructing" the
+    // lone honest sub-key. n=4, t=2 ⇒ tolerated = t-1 = 1; here 3 of 4 are corrupt.
+    #[test]
+    fn test_excess_malicious_fails_keygen() {
+        let mut mal = BTreeMap::new();
+        mal.insert(1usize, Malice::Both);
+        mal.insert(2usize, Malice::Both);
+        mal.insert(3usize, Malice::Both);
+        let mut s = DkgSession::new(4, Some(2), mal).unwrap();
+        while s.phase != Phase::Done {
+            s.advance().unwrap();
+        }
+        let snap = s.snapshot();
+        // All three cheaters are disqualified; only the honest dealer survives.
+        assert_eq!(snap.qual, vec![0]);
+        // The over-corrupted committee yields no valid key.
+        assert_eq!(
+            snap.public_key.as_ref().unwrap().reconstructed_ok,
+            Some(false)
+        );
+        assert!(snap.log.iter().any(|l| l.contains("FAILED")));
+    }
+
+    // Exactly t-1 malicious is the boundary the protocol still tolerates: it must
+    // succeed. n=6, t=3 ⇒ tolerated = 2; corrupt exactly 2.
+    #[test]
+    fn test_at_bound_malicious_succeeds() {
+        let mut mal = BTreeMap::new();
+        mal.insert(1usize, Malice::Both);
+        mal.insert(2usize, Malice::Both);
+        let mut s = DkgSession::new(6, Some(3), mal).unwrap();
+        while s.phase != Phase::Done {
+            s.advance().unwrap();
+        }
+        let snap = s.snapshot();
+        assert!(!snap.qual.contains(&1) && !snap.qual.contains(&2));
         assert_eq!(
             snap.public_key.as_ref().unwrap().reconstructed_ok,
             Some(true)

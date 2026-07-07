@@ -3,6 +3,33 @@ use ark_ec::PairingEngine;
 use ark_serialize::SerializationError;
 use thiserror::Error;
 
+/// Errors for the pairing-free VSS modules (`mss`, `pedersen`, `encryption`,
+/// `complaint`, `neji`). These are generic over a plain `ProjectiveCurve` and so
+/// must not depend on `PairingEngine` (unlike [`DKGError`]). Carries only small
+/// scalars/strings — never a group element — so it needs no type parameter.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum VssError {
+    #[error("Share check failed for receiver {0}")]
+    ShareCheck(usize),
+    #[error("VSS distribution malformed: {0}")]
+    Malformed(&'static str),
+    #[error("Lagrange recovery received duplicate or insufficient evaluation indices")]
+    BadIndices,
+    #[error("Polynomial degree too small: {0}")]
+    InsufficientDegree(usize),
+}
+
+impl<E: PairingEngine> From<VssError> for DKGError<E> {
+    fn from(e: VssError) -> Self {
+        match e {
+            VssError::ShareCheck(j) => DKGError::PedersenShareCheckError(j),
+            VssError::Malformed(s) => DKGError::PedersenMalformed(s),
+            VssError::BadIndices => DKGError::MSSBadIndices,
+            VssError::InsufficientDegree(d) => DKGError::MSSInsufficientDegree(d),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum DKGError<E: PairingEngine> {
     #[error("Ratio incorrect")]
@@ -31,4 +58,8 @@ pub enum DKGError<E: PairingEngine> {
     PedersenShareCheckError(usize),
     #[error("Pedersen distribution malformed: {0}")]
     PedersenMalformed(&'static str),
+    #[error("Feldman share check (g^s = prod C_k^{{j^k}}) failed for receiver {0}")]
+    FeldmanShareCheckError(usize),
+    #[error("Feldman/Shamir polynomial degree too small (need >= 1): {0}")]
+    FeldmanInsufficientDegree(usize),
 }
